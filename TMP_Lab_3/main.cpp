@@ -1,10 +1,15 @@
 #include <iostream>
 #include <cmath>
+#include <vector>
+#include <memory>
+#include <array>
 
 #include "omp.h"
+#include "mpi.h"
 
 #include "PoissonSolvers.h"
 #include "PoissonTests.h"
+#include "MpiPoissonSolvers.h"
 
 /*
     Макрос для создания правых частей уравнения Гельмгольца с заданным параметром k.
@@ -14,6 +19,8 @@
         using namespace std; \
         return 2. * sin(PI * y) + k * k * (1. - x) * x * sin(PI * y) + PI * PI * (1. - x) * x * sin(PI * y); \
     }
+
+#define MASTER_ID 0 // Номеп управляющего процесса
 
 const double PI = std::acos(-1.);
 
@@ -41,96 +48,75 @@ static double sol(double x, double y) {
     return (1. - x) * x * sin(PI * y);
 }
 
-int main() {
-    // Получение максимального количества потоков
-    int max_threads = omp_get_max_threads();
-    printf("[INFO] Max threads: %d\n", max_threads);
+// Структура, реализующая "пространство" функций для синхранизации данных между мастером и слейвами
+struct HelmholtzRightPartSpace {
+    static const std::array<PoissonFuncType<double>, 11> funcs;
+};
 
-    //omp_set_num_threads(4);
+const std::array<PoissonFuncType<double>, 11> HelmholtzRightPartSpace::funcs = {
+    f1, f2, f20, f40, f80, f200, f500, f1000, f2000, f4000, f8000
+};
 
+struct DummyFuncSpace { static PoissonFuncType<double> funcs[]; };
+PoissonFuncType<double> DummyFuncSpace::funcs[] = {f1};
+
+void masterProcess(MPI_Comm comm) {
+    int myid;
+    MPI_Comm_rank(comm, &myid);
+
+    bool successStatus;
+    auto ptr = mpiPoissonFuncBcast<HelmholtzRightPartSpace>(comm, MASTER_ID, &successStatus, 0);
+
+    if (ptr) {
+        std::clog << "[PROCESS " << myid << " DEBUG]: successful pass" << '\n';
+    } else {
+        std::clog << "[PROCESS " << myid << " DEBUG]: bad pass!" << '\n';
+    }
+    /*
     int n = 500;
     double h = 1. / n;
     double k = 1.;
 
-    std::vector<int> num_threads = { 1, 2, 4, 8, 12, 16, 18 };
-    std::vector<int> n_vec = { /*10, 20,*/ 250, 500, 1000, 2000, 4000 };
-    std::vector<PoissonFuncType<double>> f_vec = { /*f20, f40,*/ f500, f1000, f2000, f4000, f8000};
-    std::vector<double> k_vec = { /*20., 40.,*/ 500., 1000., 2000., 4000., 8000. };
-
-    /*
-    double* A = new double[(n + 1) * (n + 1)];
+    std::unique_ptr<double[]> A = std::make_unique<double[]>((n + 1) * (n + 1));
     for (int i = 0; i < (n + 1) * (n + 1); ++i) {
         A[i] = 0;
     }
-    
-    // printHelmholtzSolution(std::cout, A, n);
-
-    //jacobyMethodHelmholtzSolve<double>(A, n, 500., f500, h, 1e-15);
-    parallelJacobyMethodHelmholtzSolve<double>(A, n, 1000., f1000, h, 1e-15);
-    //seidelMethodHelmholtzSolve<double>(A, n, 2000., f2000, h, 1e-15);
-    //parallelSeidelMethodHelmholtzSolve<double>(A, n, 1., f1, h, 1e-15);
-
-    //printHelmholtzSolution(std::cout, A, n);
-    //printHelmholtzFuncSolution(std::cout, sol, h, n);
-
-    testHelmholtzSolution<double>(std::cout, A, n, sol, h, 1e-3);
-
-    delete[] A;
     */
+}
 
-    // Тесты для метода Якоби
-    ///*
-    for (auto cur_num_threads : num_threads) {
-        for (int i = 0; i < n_vec.size(); ++i) {
-            testParallelHelmholtzSolveMethod<double>(
-                std::cout,
-                cur_num_threads,
-                parallelJacobyMethodHelmholtzSolve,
-                "parallelJacoby",
-                n_vec[i],
-                k_vec[i],
-                f_vec[i],
-                sol,
-                1. / n_vec[i],
-                1e-3);
-        }
+void slaveProcess(MPI_Comm comm) {
+    int myid;
+    MPI_Comm_rank(comm, &myid);
+
+    bool successStatus;
+    auto ptr = mpiPoissonFuncBcast<DummyFuncSpace>(comm, MASTER_ID, &successStatus);
+
+    if (ptr) {
+        std::clog << "[PROCESS " << myid << " DEBUG]: successful pass" << '\n';
+    } else {
+        std::clog << "[PROCESS " << myid << " DEBUG]: bad pass!" << '\n';
     }
-    //*/
+}
 
-    // Тесты для метода Зейделя
-    ///*
-    for (auto cur_num_threads : num_threads) {
-        for (int i = 0; i < n_vec.size(); ++i) {
-            testParallelHelmholtzSolveMethod<double>(
-                std::cout,
-                cur_num_threads,
-                parallelSeidelMethodHelmholtzSolve,
-                "parallelSeidel",
-                n_vec[i],
-                k_vec[i],
-                f_vec[i],
-                sol,
-                1. / n_vec[i],
-                1e-3);
-        }
+int main(int argc, char** argv) {
+    int myid, numprocs;
+    int namelen;
+    char processor_name[MPI_MAX_PROCESSOR_NAME];
+
+    MPI_Init(&argc, &argv);
+    MPI_Comm_size(MPI_COMM_WORLD, &numprocs);
+    MPI_Comm_rank(MPI_COMM_WORLD, &myid);
+    MPI_Get_processor_name(processor_name, &namelen);
+
+    printf("Process %d of %d on %s\n", myid, numprocs, processor_name);
+
+    if (myid == MASTER_ID) {
+        masterProcess(MPI_COMM_WORLD);
+    } else {
+        slaveProcess(MPI_COMM_WORLD);
     }
-    //*/
 
-    /*
-    testParallelHelmholtzSolveMethod<double>(
-        std::cout,
-        4,
-        parallelSeidelMethodHelmholtzSolve,
-        "parallelSeidel",
-        n,
-        k,
-        f1,
-        sol,
-        h,
-        1e-3);
-    */
-
-    //
+    MPI_Finalize();
 
     return 0;
 }

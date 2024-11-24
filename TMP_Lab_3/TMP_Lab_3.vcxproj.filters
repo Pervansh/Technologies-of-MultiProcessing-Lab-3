@@ -26,5 +26,8 @@
     <ClInclude Include="PoissonTests.h">
       <Filter>Файлы заголовков</Filter>
     </ClInclude>
+    <ClInclude Include="MpiPoissonSolvers.h">
+      <Filter>Файлы заголовков</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>
