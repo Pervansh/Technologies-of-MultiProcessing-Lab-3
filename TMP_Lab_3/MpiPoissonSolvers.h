@@ -5,6 +5,7 @@
 #include <string.h>
 #include <chrono>
 #include <vector>
+#include <memory>
 
 #include "mpi.h"
 
@@ -17,6 +18,11 @@
 */
 
 using MpiHelmholtzSolverType = double (*)(MPI_Comm, double*, int, double, PoissonFuncType<double>, double, const double);
+
+/*
+    Требование к FuncSpace: наличие контейнера FuncSpace::funcs с
+    оператором FuncSpace::funcs[int] -> PoissonFuncType<double>
+*/
 
 template <typename FuncSpace>
 PoissonFuncType<double> mpiPoissonFuncBcast(MPI_Comm comm, int master, bool* successStatus, int funcId = -1) {
@@ -79,16 +85,79 @@ PoissonFuncType<double> mpiPoissonFuncBcast(MPI_Comm comm, int master, bool* suc
 }
 
 /*
-    Требование к FuncSpace: наличие контейнера FuncSpace::funcs с
-    оператором FuncSpace::funcs[int] -> PoissonFuncType<double>
+    Запуск метода Якоби.
+    Мастер: должны быть переданы значения для всех аргументов функции.
+    Слейв: должны быть переданы только первые 2 аргумента.
 */
 template <typename FuncSpace>
-[[deprecated]]
-double mpiMasterHelmholtzSolve(MPI_Comm comm, double const* A, int n, int funcId) {
+double mpiHelmholtzJacobyMethodSolve(MPI_Comm comm, int master, double* const A = nullptr, int n = -1, int funcId = -1) {
+    /*
+        Пусть n + 1 = k * numprocs + r. Тогда можно распределить строки следующим образом:
+        1. Каждый процесс владеет непрерывным блоком строк
+        2. 1-й процесс владеет 1-м блоком, 2-й --- 2-м и т.д.
+        3. Первые r процессов владеют (k + 1)-й строкой, остальные --- k строками
+        
+        В таком случае на каждой итерации каждый процесс будет обмениваться данными не более, чем
+        с двумя процессами (кроме MPI_Reduce).
 
-    for (int i = 0; i < (n + 1) * (n + 1); ++i) {
-        A[i] = 0;
+        Далее используем следующие обозначения:
+        mainBlocksCnt := k;
+        firstResiduProcId := r.
+    */
+
+    int myid;     // номер текущего процесса
+    int numprocs; // количество процессов в коммуникаторе
+
+    MPI_Comm_size(comm, &numprocs);
+    MPI_Comm_rank(comm, &myid);
+
+    MPI_Bcast(&n, 1, MPI_INT, master, comm);
+
+    // количество строк, которыми гарантированно владеет каждый процесс
+    int mainBlocksCnt = (n + 1) / numprocs;
+    // номер первого процесса, начиная с которого процесс владеет ровно mainBlocksCnt строками
+    int firstResiduProcId = (n + 1) % numprocs;
+    // количество строк, которыми владеет текущий процесс
+    int rowsCnt = mainBlocksCnt + (myid < firstResiduProcId);
+    // количество элементов, которыми владеет текущий процесс
+    int elemCnt = rowsCnt * (n + 1);
+
+    // Массив количеств строк, которыми владеют процессы
+    std::vector<int> sendCounts(numprocs);
+    for (int i = 0; i < numprocs; ++i) {
+        sendCounts[i] = (n + 1) * (mainBlocksCnt + (i < firstResiduProcId));
     }
+
+    // Массив номеров первых строк, которыми владеют процессы (массив сдвигов относительно начала массива)
+    std::vector<int> displs(numprocs);
+    displs[0] = 0;
+    for (int i = 1; i < numprocs; ++i) {
+        displs[i] = displs[i - 1] + sendCounts[i - 1];
+    }
+
+    // Массив строк, которыми владеет поток
+    std::vector<double> myAPart(elemCnt);
+
+    MPI_Scatterv(A, sendCounts.data(), displs.data(), MPI_DOUBLE, myAPart.data(), (n + 1) * rowsCnt, MPI_DOUBLE, master, comm);
+
+    ///* Debug info about myAPart
+    for (int proc = 0; proc < numprocs; proc++) {
+        if (proc == myid) {
+            std::cerr << "[PROCESS " << myid << " DEBUG]: my part is \n";
+            for (int i = 0; i < rowsCnt; ++i) {
+                for (int j = 0; j <= n; ++j) {
+                    std::cerr << myAPart[i * (n + 1) + j] << ' ';
+                }
+                std::cerr << '\n';
+            }
+            std::cerr << std::endl;
+        }
+
+        MPI_Barrier(comm);
+    }
+    //*/
+
+
 }
 
 /*

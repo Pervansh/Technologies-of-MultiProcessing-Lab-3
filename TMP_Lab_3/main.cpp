@@ -57,45 +57,33 @@ const std::array<PoissonFuncType<double>, 11> HelmholtzRightPartSpace::funcs = {
     f1, f2, f20, f40, f80, f200, f500, f1000, f2000, f4000, f8000
 };
 
-struct DummyFuncSpace { static PoissonFuncType<double> funcs[]; };
-PoissonFuncType<double> DummyFuncSpace::funcs[] = {f1};
+//struct DummyFuncSpace { static PoissonFuncType<double> funcs[]; };
+//PoissonFuncType<double> DummyFuncSpace::funcs[] = {f1};
 
 void masterProcess(MPI_Comm comm) {
     int myid;
     MPI_Comm_rank(comm, &myid);
 
-    bool successStatus;
-    auto ptr = mpiPoissonFuncBcast<HelmholtzRightPartSpace>(comm, MASTER_ID, &successStatus, 0);
-
-    if (ptr) {
-        std::clog << "[PROCESS " << myid << " DEBUG]: successful pass" << '\n';
-    } else {
-        std::clog << "[PROCESS " << myid << " DEBUG]: bad pass!" << '\n';
-    }
-    /*
-    int n = 500;
+    // unit-тест для случая 4-х процессов
+    int n = 5;
     double h = 1. / n;
     double k = 1.;
 
     std::unique_ptr<double[]> A = std::make_unique<double[]>((n + 1) * (n + 1));
     for (int i = 0; i < (n + 1) * (n + 1); ++i) {
-        A[i] = 0;
+        A[i] = i;
     }
-    */
+
+    
+
+    mpiHelmholtzJacobyMethodSolve<HelmholtzRightPartSpace>(comm, myid, A.get(), n, 1);
 }
 
 void slaveProcess(MPI_Comm comm) {
     int myid;
     MPI_Comm_rank(comm, &myid);
 
-    bool successStatus;
-    auto ptr = mpiPoissonFuncBcast<DummyFuncSpace>(comm, MASTER_ID, &successStatus);
-
-    if (ptr) {
-        std::clog << "[PROCESS " << myid << " DEBUG]: successful pass" << '\n';
-    } else {
-        std::clog << "[PROCESS " << myid << " DEBUG]: bad pass!" << '\n';
-    }
+    mpiHelmholtzJacobyMethodSolve<HelmholtzRightPartSpace>(comm, MASTER_ID);
 }
 
 int main(int argc, char** argv) {
