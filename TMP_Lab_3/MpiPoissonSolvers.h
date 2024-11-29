@@ -6,6 +6,7 @@
 #include <chrono>
 #include <vector>
 #include <memory>
+#include <utility>
 
 #include "mpi.h"
 
@@ -84,19 +85,15 @@ PoissonFuncType<double> mpiPoissonFuncBcast(MPI_Comm comm, int master, bool* suc
     return nullptr;
 }
 
-/*
-    Запуск метода Якоби.
-    Мастер: должны быть переданы значения для всех аргументов функции.
-    Слейв: должны быть переданы только первые 2 аргумента.
-*/
-template <typename FuncSpace>
-double mpiHelmholtzJacobyMethodSolve(MPI_Comm comm, int master, double* const A = nullptr, int n = -1, int funcId = -1) {
+// returns tuple(rowSize, myAPart)
+std::tuple<int, std::vector<double>> mpiArrayRowHomogenousScatter(MPI_Comm comm, int master, int& n, double* const A = nullptr)
+{
     /*
         Пусть n + 1 = k * numprocs + r. Тогда можно распределить строки следующим образом:
         1. Каждый процесс владеет непрерывным блоком строк
         2. 1-й процесс владеет 1-м блоком, 2-й --- 2-м и т.д.
         3. Первые r процессов владеют (k + 1)-й строкой, остальные --- k строками
-        
+
         В таком случае на каждой итерации каждый процесс будет обмениваться данными не более, чем
         с двумя процессами (кроме MPI_Reduce).
 
@@ -140,7 +137,7 @@ double mpiHelmholtzJacobyMethodSolve(MPI_Comm comm, int master, double* const A 
 
     MPI_Scatterv(A, sendCounts.data(), displs.data(), MPI_DOUBLE, myAPart.data(), (n + 1) * rowsCnt, MPI_DOUBLE, master, comm);
 
-    ///* Debug info about myAPart
+    /* Debug info about myAPart
     for (int proc = 0; proc < numprocs; proc++) {
         if (proc == myid) {
             std::cerr << "[PROCESS " << myid << " DEBUG]: my part is \n";
@@ -155,7 +152,53 @@ double mpiHelmholtzJacobyMethodSolve(MPI_Comm comm, int master, double* const A 
 
         MPI_Barrier(comm);
     }
-    //*/
+    */
+
+    return std::make_tuple(rowsCnt, std::move(myAPart)); // std::make_pair(rowsCnt, std::move(myAPart)) не работает для слейвов
+}
+
+/*
+    Запуск метода Якоби.
+    Мастер: должны быть переданы значения для всех аргументов функции.
+    Слейв: должны быть переданы только первые 2 аргумента.
+*/
+template <typename FuncSpace>
+double mpiHelmholtzJacobyMethodSolve(MPI_Comm comm, int master,
+    double* const A = nullptr,
+    int n = -1,
+    double k = 0,
+    int funcId = -1,
+    double h = 0,
+    const double minDiscrepancy = 0)
+{
+    int myid;     // номер текущего процесса
+    int numprocs; // количество процессов в коммуникаторе
+
+    MPI_Comm_size(comm, &numprocs);
+    MPI_Comm_rank(comm, &myid);
+
+    auto [rowsCnt, myAPart] = mpiArrayRowHomogenousScatter(comm, master, n, A);
+
+    /* Debug info about myAPart
+    for (int proc = 0; proc < numprocs; proc++) {
+        if (proc == myid) {
+            std::cerr << "[PROCESS " << myid << " DEBUG]: my part is " << myAPart[0] << " \n";
+            for (int i = 0; i < rowsCnt; ++i) {
+                for (int j = 0; j <= n; ++j) {
+                    std::cerr << myAPart[i * (n + 1) + j] << ' ';
+                }
+                std::cerr << '\n';
+            }
+            std::cerr << std::endl;
+        }
+
+        MPI_Barrier(comm);
+    }
+    */
+    
+    bool funcStatus;
+    // Согласованный выбор функции
+    auto f = mpiPoissonFuncBcast<FuncSpace>(comm, master, &funcStatus, funcId);
 
 
 }

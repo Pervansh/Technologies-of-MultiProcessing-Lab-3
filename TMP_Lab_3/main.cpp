@@ -76,7 +76,8 @@ void masterProcess(MPI_Comm comm) {
 
     
 
-    mpiHelmholtzJacobyMethodSolve<HelmholtzRightPartSpace>(comm, myid, A.get(), n, 1);
+    //mpiHelmholtzJacobyMethodSolve<HelmholtzRightPartSpace>(comm, myid, A.get(), n, 1);
+    mpiHelmholtzJacobyMethodSolve<HelmholtzRightPartSpace>(comm, myid, A.get(), n, k, 1, h, 1e-9);
 }
 
 void slaveProcess(MPI_Comm comm) {
