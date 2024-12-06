@@ -12,6 +12,19 @@
 
 #include "PoissonSolvers.h"
 
+#define MPI_H_SOLVE_CALC_4(coef, f, h, arr, n, i, j, rowDspl) \
+    coef * (arr[Q_IND(i - 1, j, n + 1)] + arr[Q_IND(i + 1, j, n + 1)] + arr[Q_IND(i, j - 1, n + 1)] + \
+    arr[Q_IND(i, j + 1, n + 1)] + h * h * f(j * h, (i + rowDspl) * h))
+
+#define MPI_H_SOLVE_UPPER_CALC_4(coef, f, h, arr, upperArr, n, j, rowDspl) \
+    coef * (upperArr[j] + arr[Q_IND(1, j, n + 1)] + arr[Q_IND(0, j - 1, n + 1)] + \
+    arr[Q_IND(0, j + 1, n + 1)] + h * h * f(j * h, rowDspl * h))
+
+#define MPI_H_SOLVE_LOWER_CALC_4(coef, f, h, arr, lowerArr, n, j, rowCnt, rowDspl) \
+    coef * (lowerArr[j] + arr[Q_IND(rowCnt - 2, j, n + 1)] + arr[Q_IND(rowCnt - 1, j - 1, n + 1)] + \
+    arr[Q_IND(rowCnt - 1, j + 1, n + 1)] + h * h * f(j * h, (rowDspl + rowCnt - 1) * h))
+
+
 /*
     Схема получения правой части slave-ом
     Получаем номер правой части
@@ -43,8 +56,8 @@ PoissonFuncType<double> mpiPoissonFuncBcast(MPI_Comm comm, int master, bool* suc
 
     if (myid == master) {
         masterFuncSpaceNameLen = myFuncSpaceNameLen;
-        // strcpy_s(masterFuncSpaceName, maxStrSize, myFuncSpaceName); // не работает на кластере (безопасный способ)
-        std::strcpy(masterFuncSpaceName, myFuncSpaceName); // не безопасный способ (может не хватить maxStrSize)
+        strcpy_s(masterFuncSpaceName, maxStrSize, myFuncSpaceName); // не работает на кластере (безопасный способ)
+        // std::strcpy(masterFuncSpaceName, myFuncSpaceName); // не безопасный способ (может не хватить maxStrSize)
     }
 
     /*
@@ -86,7 +99,12 @@ PoissonFuncType<double> mpiPoissonFuncBcast(MPI_Comm comm, int master, bool* suc
 }
 
 // returns tuple(rowSize, myAPart)
-std::tuple<int, std::vector<double>> mpiArrayRowHomogenousScatter(MPI_Comm comm, int master, int& n, double* const A = nullptr)
+std::tuple<int, std::unique_ptr<double[]>, int> mpiBlockRowArrayScatter(
+    MPI_Comm comm,
+    int master, 
+    int& n, 
+    double* const A = nullptr
+)
 {
     /*
         Пусть n + 1 = k * numprocs + r. Тогда можно распределить строки следующим образом:
@@ -133,9 +151,9 @@ std::tuple<int, std::vector<double>> mpiArrayRowHomogenousScatter(MPI_Comm comm,
     }
 
     // Массив строк, которыми владеет поток
-    std::vector<double> myAPart(elemCnt);
+    std::unique_ptr<double[]> myAPart = std::make_unique<double[]>(elemCnt);
 
-    MPI_Scatterv(A, sendCounts.data(), displs.data(), MPI_DOUBLE, myAPart.data(), (n + 1) * rowsCnt, MPI_DOUBLE, master, comm);
+    MPI_Scatterv(A, sendCounts.data(), displs.data(), MPI_DOUBLE, myAPart.get(), elemCnt, MPI_DOUBLE, master, comm);
 
     /* Debug info about myAPart
     for (int proc = 0; proc < numprocs; proc++) {
@@ -154,22 +172,79 @@ std::tuple<int, std::vector<double>> mpiArrayRowHomogenousScatter(MPI_Comm comm,
     }
     */
 
-    return std::make_tuple(rowsCnt, std::move(myAPart)); // std::make_pair(rowsCnt, std::move(myAPart)) не работает для слейвов
+    return std::make_tuple(rowsCnt, std::move(myAPart), displs[myid]); // std::make_pair(rowsCnt, std::move(myAPart)) не работает для слейвов
+}
+
+
+void mpiBlockRowArrayGather(
+    MPI_Comm comm,
+    int master,
+    int n,
+    double* const myAPart,
+    double* A = nullptr
+)
+{
+    /*
+        Пусть n + 1 = k * numprocs + r. Тогда можно распределить строки следующим образом:
+        1. Каждый процесс владеет непрерывным блоком строк
+        2. 1-й процесс владеет 1-м блоком, 2-й --- 2-м и т.д.
+        3. Первые r процессов владеют (k + 1)-й строкой, остальные --- k строками
+
+        В таком случае на каждой итерации каждый процесс будет обмениваться данными не более, чем
+        с двумя процессами (кроме MPI_Reduce).
+
+        Далее используем следующие обозначения:
+        mainBlocksCnt := k;
+        firstResiduProcId := r.
+    */
+
+    int myid;     // номер текущего процесса
+    int numprocs; // количество процессов в коммуникаторе
+
+    MPI_Comm_size(comm, &numprocs);
+    MPI_Comm_rank(comm, &myid);
+
+    // количество строк, которыми гарантированно владеет каждый процесс
+    int mainBlocksCnt = (n + 1) / numprocs;
+    // номер первого процесса, начиная с которого процесс владеет ровно mainBlocksCnt строками
+    int firstResiduProcId = (n + 1) % numprocs;
+    // количество строк, которыми владеет текущий процесс
+    int rowsCnt = mainBlocksCnt + (myid < firstResiduProcId);
+    // количество элементов, которыми владеет текущий процесс
+    int elemCnt = rowsCnt * (n + 1);
+
+    // Массив количеств строк, которыми владеют процессы
+    std::vector<int> recvCounts(numprocs);
+    for (int i = 0; i < numprocs; ++i) {
+        recvCounts[i] = (n + 1) * (mainBlocksCnt + (i < firstResiduProcId));
+    }
+
+    // Массив номеров первых строк, которыми владеют процессы (массив сдвигов относительно начала массива)
+    std::vector<int> displs(numprocs);
+    displs[0] = 0;
+    for (int i = 1; i < numprocs; ++i) {
+        displs[i] = displs[i - 1] + recvCounts[i - 1];
+    }
+
+    MPI_Gatherv(myAPart, elemCnt, MPI_DOUBLE, A, recvCounts.data(), displs.data(), MPI_DOUBLE, master, comm);
 }
 
 /*
     Запуск метода Якоби.
     Мастер: должны быть переданы значения для всех аргументов функции.
     Слейв: должны быть переданы только первые 2 аргумента.
+    Требования: n >= 2 * numprocs
 */
 template <typename FuncSpace>
-double mpiHelmholtzJacobyMethodSolve(MPI_Comm comm, int master,
-    double* const A = nullptr,
+double mpiJacobyMethodHelmholtzSolve(
+    MPI_Comm comm,
+    int master,
+    double* A = nullptr,
     int n = -1,
     double k = 0,
     int funcId = -1,
     double h = 0,
-    const double minDiscrepancy = 0)
+    double minDiscrepancy = 0)
 {
     int myid;     // номер текущего процесса
     int numprocs; // количество процессов в коммуникаторе
@@ -177,7 +252,10 @@ double mpiHelmholtzJacobyMethodSolve(MPI_Comm comm, int master,
     MPI_Comm_size(comm, &numprocs);
     MPI_Comm_rank(comm, &myid);
 
-    auto [rowsCnt, myAPart] = mpiArrayRowHomogenousScatter(comm, master, n, A);
+    auto [rowCnt, oldMyYPart, rowDspl] = mpiBlockRowArrayScatter(comm, master, n, A);
+    std::unique_ptr<double[]> newMyYPart = std::make_unique<double[]>(rowCnt * (n + 1));
+
+    std::memcpy(newMyYPart.get(), oldMyYPart.get(), rowCnt * (n + 1));
 
     /* Debug info about myAPart
     for (int proc = 0; proc < numprocs; proc++) {
@@ -200,83 +278,67 @@ double mpiHelmholtzJacobyMethodSolve(MPI_Comm comm, int master,
     // Согласованный выбор функции
     auto f = mpiPoissonFuncBcast<FuncSpace>(comm, master, &funcStatus, funcId);
 
+    if (!funcStatus) {
+        return -1.; // Значение, соответствующее ошибке
+    }
 
-}
-
-/*
-    Решение методом Якоби с применением MPI шаблоном "крест" уравнения Гельмгольца с коэффициентом k
-    и правой частью f для случая граничных условий 1-го рода в квадратной области.
-    A - указатель на матрицу размера (n + 1)*(n + 1), хранящую в граничных элементах значения ГУ и
-        во внутренних элементах - начальные значения решения внутри области для метода Якоби,
-        в который будет перезаписан результат работы метода, y - строки, x - столбцы;
-    n - размерность сетки по x- и y-координате (количество ячеек);
-    k - коэффициент (точнее его корень) при линейном члене уравнения;
-    f - функция правой части, f = f(x, y);
-    h - шаг сетки.
-    Нумерация узлов (внутренних): естественная (построчная).
-    Распределение узлов по процессам: i-ая строка матрицы - (i mod comm_size)-му процессу
-*/
-[[deprecated]]
-double mpiJacobyMethodHelmholtzSolve(
-    MPI_Comm comm,
-    double* A,
-    int n,
-    double k,
-    PoissonFuncType<double> f,
-    double h,
-    const double minDiscrepancy)
-{
-    int myid;     // номер текущего процесса
-    int numprocs; // количество процессов в коммуникаторе
-
-    MPI_Comm_size(comm, &numprocs);
-    MPI_Comm_rank(comm, &myid);
-
-    /*
-        Распределение строк по процессам:
-        0, 1, 2, ..., numprocs - 1, numprocs, 0, 1, ..., firstResiduProcId - 1,
-        где
-        0, 1, ..., numprocs - основной период владения (mainBlock).
-        Заметим, что все процессы до firstResiduProcId владеет (mainBlocksCnt + 1) строками,
-        а после firstResiduProcId --- mainBlocksCnt строками.
-    */
-
-    // количество периодов владения строк процессами
-    int mainBlocksCnt = (n + 1) / numprocs;
-    // номер первого процесса, начиная с которого процесс владеет mainBlocksCnt строками
-    int firstResiduProcId = (n + 1) % numprocs;
-
-    // количество строк, которыми владеет текущий процесс
-    int rowsCnt = mainBlocksCnt + (myid < firstResiduProcId);
-
-
-    double* newY = new double[(n + 1) * (n + 1)]; // Значения на следующей итерации
-    double* oldY = A;            // Значения на предыдущей итерации
-
-    //printHelmholtzSolution(std::cout, A, n);
-    //printHelmholtzSolution(std::cout, newY, n);
+    // Bcast остальных параметров
+    MPI_Bcast(&k, 1, MPI_DOUBLE, master, comm);
+    MPI_Bcast(&h, 1, MPI_DOUBLE, master, comm);
+    MPI_Bcast(&minDiscrepancy, 1, MPI_DOUBLE, master, comm);
 
     double coef = 1. / (4. + k * k * h * h);
 
-    auto start_time = std::chrono::high_resolution_clock::now();
+    std::unique_ptr<double[]> upperPart = std::make_unique<double[]>(n + 1);
+    std::unique_ptr<double[]> lowerPart = std::make_unique<double[]>(n + 1);
 
-    // запись ГУ в newY
-    for (int i = 0; i <= n - 1; ++i) {
-        // обработка элементов на горизонтальных границах
-        newY[Q_IND(0, i, n + 1)] = A[Q_IND(0, i, n + 1)]; // верхний край
-        newY[Q_IND(n, n - i, n + 1)] = A[Q_IND(n, n - i, n + 1)]; // нижний край
-        // обработка элементов на вертикальных границах
-        newY[Q_IND(n - i, 0, n + 1)] = A[Q_IND(n - i, 0, n + 1)]; // левый край
-        newY[Q_IND(i, n, n + 1)] = A[Q_IND(i, n, n + 1)]; // правый край
+    MPI_Request upperSend, upperRecv, lowerSend, lowerRecv;
+    
+    auto firstRowPtr = oldMyYPart.get();
+    auto lastRowPtr  = oldMyYPart.get() + (n + 1) * (rowCnt - 1);
 
-        /*
-        auto val1 = A[Q_IND(0, i, n + 1)];
-        auto val2 = A[Q_IND(n, n - i, n + 1)];
-        auto val3 = A[Q_IND(n - i, 0, n + 1)];
-        auto val4 = A[Q_IND(i, n, n + 1)];
-        auto val = 0;
-        */
+    if (myid > 0) {
+        MPI_Send_init(firstRowPtr, n + 1, MPI_DOUBLE, myid - 1, 0, comm, &upperSend);
+        MPI_Recv_init(upperPart.get(), n + 1, MPI_DOUBLE, myid - 1, 0, comm, &upperRecv);
+    } else {
+        upperSend = MPI_REQUEST_NULL;
+        upperRecv = MPI_REQUEST_NULL;
     }
+
+    if (myid < numprocs - 1) {
+        MPI_Send_init(lastRowPtr, n + 1, MPI_DOUBLE, myid + 1, 0, comm, &lowerSend);
+        MPI_Recv_init(lowerPart.get(), n + 1, MPI_DOUBLE, myid + 1, 0, comm, &lowerRecv);
+    } else {
+        lowerSend = MPI_REQUEST_NULL;
+        lowerRecv = MPI_REQUEST_NULL;
+    }
+
+    MPI_Request allRequests[]  = { upperSend, upperRecv, lowerSend, lowerRecv };
+    MPI_Request recvRequests[] = { upperRecv, lowerRecv };
+
+    // Предварительная пересылка смежных строк
+    //MPI_Startall(4, allRequests);
+    if (myid > 0) {
+        MPI_Start(&upperSend);
+        MPI_Start(&upperRecv);
+    }
+    if (myid < numprocs - 1) {
+        MPI_Start(&lowerSend);
+        MPI_Start(&lowerRecv);
+    }
+
+    if (myid > 0) {
+        MPI_Status status;
+        MPI_Wait(&upperRecv, &status);
+    }
+    if (myid < numprocs - 1) {
+        MPI_Status status;
+        MPI_Wait(&lowerRecv, &status);
+    }
+    //MPI_Status statuses[2];
+    //MPI_Waitall(2, recvRequests, statuses); // без провери статусов
+
+    auto start_time = std::chrono::high_resolution_clock::now();
 
     // printHelmholtzSolution(std::cout, newY, n);
 
@@ -284,121 +346,110 @@ double mpiJacobyMethodHelmholtzSolve(
 
     int iterCount = 0;
     for (; iterCount < MAX_ITER_COUNT && discrepancy >= minDiscrepancy; iterCount++) {
-        // printHelmholtzSolution(std::cout, A, n);
 
-        // обработка элементов внутри области
-        for (int i = 1; i <= n - 1; ++i) {
+        // printHelmholtzSolution(std::cout, A, n);
+    
+        // обработка элементов внутри блока
+        for (int i = 1; i < rowCnt - 1; ++i) {
             for (int j = 1; j <= n - 1; ++j) {
-                newY[Q_IND(i, j, n + 1)] = H_SOLVE_JACOBY_CALC_4(coef, f, h, oldY, n, i, j);
+                newMyYPart[Q_IND(i, j, n + 1)] = MPI_H_SOLVE_CALC_4(coef, f, h, oldMyYPart, n, i, j, rowDspl);
             }
         }
 
+        // обработка верхней строки
+        if (myid > 0) {
+            for (int j = 1; j <= n - 1; ++j) {
+                newMyYPart[Q_IND(0, j, n + 1)] =
+                    MPI_H_SOLVE_UPPER_CALC_4(coef, f, h, oldMyYPart, upperPart, n, j, rowDspl);
+            }
+        }
+
+        // обработка нижней строки
+        if (myid < numprocs - 1) {
+            for (int j = 1; j <= n - 1; ++j) {
+                newMyYPart[Q_IND(rowCnt - 1, j, n + 1)] =
+                    MPI_H_SOLVE_LOWER_CALC_4(coef, f, h, oldMyYPart, lowerPart, n, j, rowCnt, rowDspl);
+            }
+        }
+
+        // Смена слоев и пересылка сменжных строк
+        std::swap(newMyYPart, oldMyYPart);
+
+        if (myid > 0) {
+            MPI_Status status;
+            MPI_Wait(&upperSend, &status);
+        }
+        if (myid < numprocs - 1) {
+            MPI_Status status;
+            MPI_Wait(&lowerSend, &status);
+        }
+
+        if (myid > 0) {
+            MPI_Start(&upperSend);
+            MPI_Start(&upperRecv);
+        }
+        if (myid < numprocs - 1) {
+            MPI_Start(&lowerSend);
+            MPI_Start(&lowerRecv);
+        }
+
+        if (myid > 0) {
+            MPI_Status status;
+            MPI_Wait(&upperRecv, &status);
+        }
+        if (myid < numprocs - 1) {
+            MPI_Status status;
+            MPI_Wait(&lowerRecv, &status);
+        }
+        
         // расчет текущей невязки
-        discrepancy = double(0);
-        for (int i = 1; i <= n - 1; ++i) {
+        discrepancy = 0.;
+        for (int i = 1; i < rowCnt - 1; ++i) {
             for (int j = 1; j <= n - 1; ++j) {
                 discrepancy = std::max(discrepancy,
-                    std::fabs(newY[Q_IND(i, j, n + 1)] - H_SOLVE_JACOBY_CALC_4(coef, f, h, newY, n, i, j)));
+                    std::fabs(oldMyYPart[Q_IND(i, j, n + 1)] -
+                        MPI_H_SOLVE_CALC_4(coef, f, h, oldMyYPart, n, i, j, rowDspl)));
             }
         }
 
-        // printHelmholtzSolution(std::cout, newY, n);
+        // невязка для верхней строки
+        if (myid > 0) {
+            for (int j = 1; j <= n - 1; ++j) {
+                discrepancy = std::max(discrepancy,
+                    std::fabs(oldMyYPart[Q_IND(0, j, n + 1)] -
+                        MPI_H_SOLVE_UPPER_CALC_4(coef, f, h, oldMyYPart, upperPart, n, j, rowDspl)));
+            }
+        }
 
-        // меняем указатели на массивы местами (теперь в oldY хранится результат текущей итерации)
-        std::swap(newY, oldY);
+        // невязка для нижней строки
+        if (myid < numprocs - 1) {
+            for (int j = 1; j <= n - 1; ++j) {
+                discrepancy = std::max(discrepancy,
+                    std::fabs(oldMyYPart[Q_IND(rowCnt - 1, j, n + 1)] -
+                        MPI_H_SOLVE_LOWER_CALC_4(coef, f, h, oldMyYPart, upperPart, n, j, rowCnt, rowDspl)));
+            }
+        }
+
+        double gottenDiscrepancy;
+        MPI_Allreduce(&discrepancy, &gottenDiscrepancy, 1, MPI_DOUBLE, MPI_MAX, comm);
+        discrepancy = gottenDiscrepancy;
     }
-    // Окончательный результат хранится по адресу oldY
+    // Окончательный результат хранится по адресу oldMyYPart
 
     auto end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end_time - start_time;
 
-    // std::cout << "is okay? : " << (A == oldY) << std::endl;
+    // Сборка конечного решения на мастере
+    mpiBlockRowArrayGather(comm, master, n, oldMyYPart.get(), A);
 
-    // Убеждаемся, что по адресу A будет записан результат метода
-    if (newY == A) {
-        // std::memcpy(A, oldY, sizeof(T) * (n + 1) * (n + 1)); // Не работает, нет времени разбираться + не параллелится
-
-        for (int i = 0; i < (n + 1) * (n + 1); ++i) {
-            A[i] = oldY[i];
-        }
-
-        // Освобождение дополнительно выделенной памяти
-        delete[] oldY;
-    } else {
-
-        // Освобождение дополнительно выделенной памяти
-        delete[] newY;
-    }
-
-    std::cout << "[DEBUG]: iterCount = " << iterCount << std::endl;
+    if (myid == master)
+        std::cout << "[DEBUG]: iterCount = " << iterCount << std::endl;
 
     //return iterCount >= MAX_ITER_COUNT;
     return elapsed.count();
 }
 
 /*
-    Решение методом Зейделя с применением MPI шаблоном "крест" уравнения Гельмгольца с коэффициентом k
-    и правой частью f для случая граничных условий 1-го рода в квадратной области.
-    A - указатель на матрицу размера (n + 1)*(n + 1), хранящую в граничных элементах значения ГУ и
-        во внутренних элементах - начальные значения решения внутри области для метода Зейделя,
-        в который будет перезаписан результат работы метода, y - строки, x - столбцы;
-    n - размерность сетки по x- и y-координате (количество ячеек);
-    k - коэффициент (точнее его корень) при линейном члене уравнения;
-    f - функция правой части, f = f(x, y);
-    h - шаг сетки.
-    Нумерация узлов (внутренних): красно-черная, узел (1, 1) - красный.
-*/
-[[deprecated]]
-double mpiSeidelMethodHelmholtzSolve(
-    MPI_Comm comm, 
-    double* A, 
-    int n, 
-    double k, 
-    PoissonFuncType<double> f, 
-    double h, 
-    const double minDiscrepancy) 
-{
-    double coef = 1. / (4. + k * k * h * h);
-
-    double discrepancy = double(1e18);
-
-    auto start_time = std::chrono::high_resolution_clock::now();
-
-    int iterCount = 0;
-    for (; iterCount < MAX_ITER_COUNT && discrepancy >= minDiscrepancy; iterCount++) {
-        // обработка красных элементов внутри области
-        for (int i = 1; i <= n - 1; ++i) { // проходимся по слоям
-            for (int j = 2 - i % 2; j <= n - 1; j += 2) { // переступаем черные узлы
-                A[Q_IND(i, j, n + 1)] = H_SOLVE_JACOBY_CALC_4(coef, f, h, A, n, i, j);
-            }
-        }
-
-        // обработка черных элементов внутри области
-        for (int i = 1; i <= n - 1; ++i) { // проходимся по слоям
-            for (int j = 1 + i % 2; j <= n - 1; j += 2) { // переступаем красные узлы
-                A[Q_IND(i, j, n + 1)] = H_SOLVE_JACOBY_CALC_4(coef, f, h, A, n, i, j);
-            }
-        }
-
-        // расчет текущей невязки
-        discrepancy = double(0);
-        for (int i = 1; i <= n - 1; ++i) {
-            for (int j = 1; j <= n - 1; ++j) {
-                discrepancy = std::max(discrepancy,
-                    std::fabs(A[Q_IND(i, j, n + 1)] - H_SOLVE_JACOBY_CALC_4(coef, f, h, A, n, i, j)));
-            }
-        }
-    }
-
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = end_time - start_time;
-
-    std::cout << "[DEBUG]: iterCount = " << iterCount << std::endl;
-
-    //return iterCount >= MAX_ITER_COUNT;
-    return elapsed.count();
-}
-
 // Статический класс для доступа к списку MPI-решателей по id
 class MpiHelmholtzSolvers {
 public:
@@ -425,3 +476,4 @@ public:
         return solvers[id];
     }
 };
+*/
