@@ -143,11 +143,18 @@ std::tuple<int, std::unique_ptr<double[]>, int> mpiBlockRowArrayScatter(
         sendCounts[i] = (n + 1) * (mainBlocksCnt + (i < firstResiduProcId));
     }
 
-    // Массив номеров первых строк, которыми владеют процессы (массив сдвигов относительно начала массива)
+    // Массив номеров первых элементов, которыми владеют процессы (массив сдвигов относительно начала массива)
     std::vector<int> displs(numprocs);
     displs[0] = 0;
     for (int i = 1; i < numprocs; ++i) {
         displs[i] = displs[i - 1] + sendCounts[i - 1];
+    }
+
+    // Массив номеров первых строк, которыми владеют процессы
+    std::vector<int> rowDispls(numprocs);
+    rowDispls[0] = 0;
+    for (int i = 1; i < numprocs; ++i) {
+        rowDispls[i] = rowDispls[i - 1] + mainBlocksCnt + ((i - 1) < firstResiduProcId);
     }
 
     // Массив строк, которыми владеет поток
@@ -172,7 +179,7 @@ std::tuple<int, std::unique_ptr<double[]>, int> mpiBlockRowArrayScatter(
     }
     */
 
-    return std::make_tuple(rowsCnt, std::move(myAPart), displs[myid]); // std::make_pair(rowsCnt, std::move(myAPart)) не работает для слейвов
+    return std::make_tuple(rowsCnt, std::move(myAPart), rowDispls[myid]); // std::make_pair(rowsCnt, std::move(myAPart)) не работает для слейвов
 }
 
 
@@ -255,7 +262,10 @@ double mpiJacobyMethodHelmholtzSolve(
     auto [rowCnt, oldMyYPart, rowDspl] = mpiBlockRowArrayScatter(comm, master, n, A);
     std::unique_ptr<double[]> newMyYPart = std::make_unique<double[]>(rowCnt * (n + 1));
 
-    std::memcpy(newMyYPart.get(), oldMyYPart.get(), rowCnt * (n + 1));
+    //std::memcpy(newMyYPart.get(), oldMyYPart.get(), rowCnt * (n + 1));
+    for (int i = 0; i < rowCnt * (n + 1); ++i) {
+        newMyYPart[i] = oldMyYPart[i];
+    }
 
     /* Debug info about myAPart
     for (int proc = 0; proc < numprocs; proc++) {
@@ -289,16 +299,30 @@ double mpiJacobyMethodHelmholtzSolve(
 
     double coef = 1. / (4. + k * k * h * h);
 
+    /*
+    for (int proc = 0; proc < numprocs; proc++) {
+        if (proc == myid) {
+            std::cerr << "[PROCESS " << myid << " DEBUG]: my rowDspl:" << rowDspl << " \n";
+            std::cerr << "[PROCESS " << myid << " DEBUG]: my coef:" << coef << " \n";
+        }
+        MPI_Barrier(comm);
+    }
+    */
+
     std::unique_ptr<double[]> upperPart = std::make_unique<double[]>(n + 1);
     std::unique_ptr<double[]> lowerPart = std::make_unique<double[]>(n + 1);
 
     MPI_Request upperSend, upperRecv, lowerSend, lowerRecv;
     
-    auto firstRowPtr = oldMyYPart.get();
-    auto lastRowPtr  = oldMyYPart.get() + (n + 1) * (rowCnt - 1);
+    /*
+      Для перессылки первой и последней строки блока нужны отдельные массивы, т.к. после
+      каждой итерации происходит swap указателей текущего и предыдущего слоя
+    */
+    std::unique_ptr<double[]> firstRow = std::make_unique<double[]>(n + 1); // Массив значений на первой строке блока
+    std::unique_ptr<double[]> lastRow  = std::make_unique<double[]>(n + 1); // Массив значений на последней строке блока
 
     if (myid > 0) {
-        MPI_Send_init(firstRowPtr, n + 1, MPI_DOUBLE, myid - 1, 0, comm, &upperSend);
+        MPI_Send_init(firstRow.get(), n + 1, MPI_DOUBLE, myid - 1, 0, comm, &upperSend);
         MPI_Recv_init(upperPart.get(), n + 1, MPI_DOUBLE, myid - 1, 0, comm, &upperRecv);
     } else {
         upperSend = MPI_REQUEST_NULL;
@@ -306,15 +330,18 @@ double mpiJacobyMethodHelmholtzSolve(
     }
 
     if (myid < numprocs - 1) {
-        MPI_Send_init(lastRowPtr, n + 1, MPI_DOUBLE, myid + 1, 0, comm, &lowerSend);
+        MPI_Send_init(lastRow.get(), n + 1, MPI_DOUBLE, myid + 1, 0, comm, &lowerSend);
         MPI_Recv_init(lowerPart.get(), n + 1, MPI_DOUBLE, myid + 1, 0, comm, &lowerRecv);
     } else {
         lowerSend = MPI_REQUEST_NULL;
         lowerRecv = MPI_REQUEST_NULL;
     }
 
-    MPI_Request allRequests[]  = { upperSend, upperRecv, lowerSend, lowerRecv };
-    MPI_Request recvRequests[] = { upperRecv, lowerRecv };
+    // Обновление массивов первой и последней строк перед пересылкой
+    for (int j = 0; j <= n; ++j) {
+        firstRow[j] = oldMyYPart[Q_IND(0, j, n + 1)];
+        lastRow[j]  = oldMyYPart[Q_IND(rowCnt - 1, j, n + 1)];
+    }
 
     // Предварительная пересылка смежных строк
     //MPI_Startall(4, allRequests);
@@ -375,6 +402,63 @@ double mpiJacobyMethodHelmholtzSolve(
         // Смена слоев и пересылка сменжных строк
         std::swap(newMyYPart, oldMyYPart);
 
+        /*
+        for (int proc = 0; proc < numprocs; proc++) {
+            if (proc == myid) {
+                std::cerr << "[PROCESS " << myid << " DEBUG]: my part is " << " \n";
+                for (int i = 0; i < rowCnt; ++i) {
+                    for (int j = 0; j <= n; ++j) {
+                        std::cerr << oldMyYPart[i * (n + 1) + j] << ' ';
+                    }
+                    std::cerr << '\n';
+                }
+                std::cerr << std::endl;
+            }
+
+            MPI_Barrier(comm);
+        }
+
+        for (int proc = 0; proc < numprocs; proc++) {
+            if (proc == myid) {
+                std::cerr << "[PROCESS " << myid << " DEBUG]: " << " \n";
+                std::cerr << "firstRow: ";
+                for (int j = 0; j <= n; ++j) {
+                    std::cerr << firstRow[j] << ' ';
+                }
+                std::cerr << '\n';
+
+                std::cerr << "lastRow: ";
+                    for (int j = 0; j <= n; ++j) {
+                        std::cerr << lastRow[j] << ' ';
+                    }
+                std::cerr << '\n';
+
+                if (myid > 0) {
+                    std::cerr << "upperPart: ";
+                        for (int j = 0; j <= n; ++j) {
+                            std::cerr << upperPart[j] << ' ';
+                        }
+                    std::cerr << '\n';
+                }
+
+                if (myid < numprocs - 1) {
+                    std::cerr << "lowerPart: ";
+                        for (int j = 0; j <= n; ++j) {
+                            std::cerr << lowerPart[j] << ' ';
+                        }
+                    std::cerr << '\n';
+                }
+
+                std::cerr << std::endl;
+            }
+
+            MPI_Barrier(comm);
+        }
+
+        // system("pause");
+        */
+
+        // Ожидание отправки смежных слоев перед перезаписыванием
         if (myid > 0) {
             MPI_Status status;
             MPI_Wait(&upperSend, &status);
@@ -382,6 +466,12 @@ double mpiJacobyMethodHelmholtzSolve(
         if (myid < numprocs - 1) {
             MPI_Status status;
             MPI_Wait(&lowerSend, &status);
+        }
+
+        // Обновление массивов первой и последней строк перед пересылкой
+        for (int j = 0; j <= n; ++j) {
+            firstRow[j] = oldMyYPart[Q_IND(0, j, n + 1)];
+            lastRow[j]  = oldMyYPart[Q_IND(rowCnt - 1, j, n + 1)];
         }
 
         if (myid > 0) {
@@ -426,7 +516,7 @@ double mpiJacobyMethodHelmholtzSolve(
             for (int j = 1; j <= n - 1; ++j) {
                 discrepancy = std::max(discrepancy,
                     std::fabs(oldMyYPart[Q_IND(rowCnt - 1, j, n + 1)] -
-                        MPI_H_SOLVE_LOWER_CALC_4(coef, f, h, oldMyYPart, upperPart, n, j, rowCnt, rowDspl)));
+                        MPI_H_SOLVE_LOWER_CALC_4(coef, f, h, oldMyYPart, lowerPart, n, j, rowCnt, rowDspl)));
             }
         }
 

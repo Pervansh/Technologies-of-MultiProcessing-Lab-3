@@ -65,19 +65,31 @@ void masterProcess(MPI_Comm comm) {
     MPI_Comm_rank(comm, &myid);
 
     // unit-тест для случая 4-х процессов
-    int n = 100;
+    int n = 20;
     double h = 1. / n;
-    double k = 200.;
+    double k = 40.;
 
     std::unique_ptr<double[]> A = std::make_unique<double[]>((n + 1) * (n + 1));
     for (int i = 0; i < (n + 1) * (n + 1); ++i) {
-        A[i] = i;
+        A[i] = 0;
     }
 
     //mpiHelmholtzJacobyMethodSolve<HelmholtzRightPartSpace>(comm, myid, A.get(), n, 1);
-    mpiJacobyMethodHelmholtzSolve<HelmholtzRightPartSpace>(comm, myid, A.get(), n, k, 5, h, 1e-9);
+    mpiJacobyMethodHelmholtzSolve<HelmholtzRightPartSpace>(comm, myid, A.get(), n, k, 3, h, 1e-9);
 
     testHelmholtzSolution<double>(std::cout, A.get(), n, sol, h, 1e-6);
+
+    /*
+    for (int i = 0; i < (n + 1) * (n + 1); ++i) {
+        A[i] = 0;
+    }
+
+    jacobyMethodHelmholtzSolve(A.get(), n, k, f40, h, 1e-9);
+
+    printHelmholtzSolution(std::cout, A.get(), n);
+
+    testHelmholtzSolution<double>(std::cout, A.get(), n, sol, h, 1e-6);
+    */
 }
 
 void slaveProcess(MPI_Comm comm) {
